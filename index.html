@@ -1,0 +1,451 @@
+<canvas id="app"></canvas>
+
+<style>
+  :root { --bg:transparent; }  /* was #0d1218 */
+  html,body{
+    margin:0;
+    height:100%;
+    background:transparent;   /* key line: fully transparent */
+    overflow:hidden;
+  }
+  #app{
+    width:100vw;
+    height:420px;
+    display:block;
+    background:transparent;   /* make canvas transparent too */
+  }
+</style>
+
+<script src="https://unpkg.com/three@0.158.0/build/three.min.js"></script>
+
+<script>
+(() => {
+/* ===================== SUPER-CLEAR TEXT KNOBS ===================== */
+// — sampling / density —
+const SAMPLE_STEP    = 2;        // ↓ smaller = more dots = sharper letters
+
+// — static dots —
+const TEXT           = 'AI - Enhanced MEP';
+const TEXT_BASE_SIZE = 120;
+const TEXT_Y_RATIO   = 0.70;
+const TEXT_POINT_SIZE= 2.6;      // a touch smaller dots for sharper edge
+const TEXT_OPACITY   = 0.98;
+const GLOW_OPACITY   = 0.05;
+const GLOW_BLUR      = 9;
+
+// micro idle shimmer
+const TEXT_JITTER_MIN= 0.04;
+const TEXT_JITTER_MAX= 0.10;
+const TEXT_FREQ_MIN  = 0.45;
+const TEXT_FREQ_MAX  = 0.8;
+
+// — emission —
+const BIRTH_RATE = 720;
+const LIFE_S     = 1.9;
+const SIZE_PX    = 7.0;
+const SPEED_UP   = 78;
+const GRAVITY    = 9;
+
+// — randomness (very low) —
+const NOISE_SCALE= 1.0;
+const NOISE_STR_X= 0.04;        // almost no horizontal wiggle
+const NOISE_STR_Y= 0.22;        // small vertical swirl
+const NOISE_BASE = 1.6;
+
+// — shape binding (strong + critically damped) —
+const SHAPE_STIFF_X = 360;
+const SHAPE_STIFF_Y = 240;
+const SHAPE_DAMP_X  = 30;
+const SHAPE_DAMP_Y  = 26;
+const SHAPE_HOVER   = 2;
+
+// — leash & confinement —
+const LEASH_RADIUS    = 3;
+const LEASH_GAIN      = 320;
+const CONFINE_THRESH  = 170;     // stricter "inside"
+const CONFINE_GAIN    = 9000;    // strong push inward
+const CONFINE_FALLOFF = 12;
+const EDGE_BIAS_BAND  = 32;      // edge helper
+const EDGE_BIAS_GAIN  = 5000;
+
+// — hover —
+const ATTR_R = 160, ATTR_A = 40, ATTR_DAMP = 0.58;
+
+// — smoothness cap —
+const MAX_SPEED = 128;
+const DPR_CAP   = 1.75;
+/* ================================================================= */
+
+const canvas   = document.getElementById('app');
+const dpr      = Math.min(DPR_CAP, Math.max(1, window.devicePixelRatio||1));
+const renderer = new THREE.WebGLRenderer({ canvas, antialias:true, alpha:true });
+renderer.setPixelRatio(dpr);
+const scene  = new THREE.Scene();
+const camera = new THREE.OrthographicCamera();
+
+function dotSharp(size=64){
+  const c=document.createElement('canvas'); c.width=c.height=size;
+  const g=c.getContext('2d'); const r=size/2;
+  const grad=g.createRadialGradient(r,r,0,r,r,r);
+  grad.addColorStop(0,'rgba(255,255,255,1)');
+  grad.addColorStop(0.82,'rgba(255,255,255,1)');
+  grad.addColorStop(1,'rgba(255,255,255,0)');
+  g.fillStyle=grad; g.beginPath(); g.arc(r,r,r,0,Math.PI*2); g.fill();
+  const tex=new THREE.CanvasTexture(c); tex.anisotropy=4; return tex;
+}
+
+/* ---------- text → points + mask + helper textures ---------- */
+let basePts=[], maskData=null, maskW=0, maskH=0;
+let glowTex=null, fillTex=null, strokeTex=null;
+
+const off=document.createElement('canvas');
+const octx=off.getContext('2d');
+
+function rasterText(w,h){
+  off.width=w; off.height=h;
+
+  // draw solid text for mask
+  let f=TEXT_BASE_SIZE; octx.font=`900 ${f}px system-ui,-apple-system,Segoe UI,Roboto,Arial`;
+  while(octx.measureText(TEXT).width>w-40 && f>24){ f-=2; octx.font=`900 ${f}px system-ui,-apple-system,Segoe UI,Roboto,Arial`; }
+  octx.textAlign='center'; octx.textBaseline='middle';
+  octx.fillStyle='#fff'; octx.clearRect(0,0,w,h); octx.fillText(TEXT, w/2, h*TEXT_Y_RATIO);
+
+  // build points from mask
+  const img=octx.getImageData(0,0,w,h); maskData=img.data; maskW=w; maskH=h;
+  const A=(x,y)=>(y*w+x)*4+3;
+  const pts=[];
+  for(let y=1;y<h-1;y+=SAMPLE_STEP)
+    for(let x=1;x<w-1;x+=SAMPLE_STEP)
+      if(maskData[A(x,y)]>128) pts.push({x,y});
+  basePts=pts;
+
+  // glow (soft)
+  {
+    const c=document.createElement('canvas'); c.width=w; c.height=h;
+    const g=c.getContext('2d');
+    g.globalAlpha=GLOW_OPACITY; g.filter=`blur(${GLOW_BLUR}px)`;
+    g.fillStyle='#cfe6ff'; g.textAlign='center'; g.textBaseline='middle';
+    g.font=`900 ${f}px system-ui,-apple-system,Segoe UI,Roboto,Arial`;
+    g.fillText(TEXT, w/2, h*TEXT_Y_RATIO);
+    glowTex=new THREE.CanvasTexture(c); glowTex.needsUpdate=true;
+  }
+  // crisp fill (very low opacity)
+  {
+    const c=document.createElement('canvas'); c.width=w; c.height=h;
+    const g=c.getContext('2d');
+    g.globalAlpha=0.10;
+    g.fillStyle='#ffffff'; g.textAlign='center'; g.textBaseline='middle';
+    g.font=`900 ${f}px system-ui,-apple-system,Segoe UI,Roboto,Arial`;
+    g.fillText(TEXT, w/2, h*TEXT_Y_RATIO);
+    fillTex=new THREE.CanvasTexture(c); fillTex.needsUpdate=true;
+  }
+  // crisp stroke (thin edge hint)
+  {
+    const c=document.createElement('canvas'); c.width=w; c.height=h;
+    const g=c.getContext('2d');
+    g.globalAlpha=0.22;
+    g.lineWidth=Math.max(2, f*0.02);   // thin outline
+    g.strokeStyle='#ffffff'; g.lineJoin='round'; g.lineCap='round';
+    g.textAlign='center'; g.textBaseline='middle';
+    g.font=`900 ${f}px system-ui,-apple-system,Segoe UI,Roboto,Arial`;
+    g.strokeText(TEXT, w/2, h*TEXT_Y_RATIO);
+    strokeTex=new THREE.CanvasTexture(c); strokeTex.needsUpdate=true;
+  }
+}
+
+function alphaAt(x,y){
+  x=Math.max(0, Math.min(maskW-1, x|0));
+  y=Math.max(0, Math.min(maskH-1, y|0));
+  return maskData[(y*maskW + x)*4 + 3];
+}
+function gradAt(x,y){
+  const ax1=alphaAt(x+1,y), ax0=alphaAt(x-1,y);
+  const ay1=alphaAt(x,y+1), ay0=alphaAt(x,y-1);
+  let gx=(ax1-ax0), gy=(ay1-ay0);
+  const len=Math.hypot(gx,gy)||1;
+  return {nx: gx/len, ny: gy/len}; // inward normal
+}
+
+/* ---------- base dot mesh + helper planes ---------- */
+let textMesh, textGeom, textMat, textPos, textHome, textVel;
+let glowMesh, fillMesh, strokeMesh;
+let tSeed, tAmp, tFreq;
+
+function buildText(viewW,viewH){
+  if(textMesh){ scene.remove(textMesh); textGeom.dispose(); textMat.dispose(); }
+  const N=basePts.length;
+  textPos=new Float32Array(N*3);
+  textHome=new Float32Array(N*2);
+  textVel=new Float32Array(N*2);
+  tSeed=new Float32Array(N);
+  tAmp =new Float32Array(N);
+  tFreq=new Float32Array(N);
+  for(let i=0;i<N;i++){
+    const p=basePts[i], j=i*3, k=i*2;
+    textPos[j]=p.x; textPos[j+1]=p.y; textPos[j+2]=0;
+    textHome[k]=p.x; textHome[k+1]=p.y;
+    textVel[k]=textVel[k+1]=0;
+    tSeed[i]=Math.random()*1000;
+    tAmp[i]=TEXT_JITTER_MIN + Math.random()*(TEXT_JITTER_MAX-TEXT_JITTER_MIN);
+    tFreq[i]=TEXT_FREQ_MIN + Math.random()*(TEXT_FREQ_MAX-TEXT_FREQ_MIN);
+  }
+  textGeom=new THREE.BufferGeometry();
+  textGeom.setAttribute('position', new THREE.BufferAttribute(textPos,3));
+  textMat=new THREE.PointsMaterial({
+    map:dotSharp(64), size:TEXT_POINT_SIZE, sizeAttenuation:true,
+    transparent:true, depthWrite:false, opacity:TEXT_OPACITY, color:0xffffff
+  });
+  textMesh=new THREE.Points(textGeom,textMat); scene.add(textMesh);
+
+  // helper planes: glow (back), fill (middle), stroke (front)
+  if(glowMesh){ scene.remove(glowMesh); glowMesh.geometry.dispose(); glowMesh.material.dispose(); }
+  if(fillMesh){ scene.remove(fillMesh); fillMesh.geometry.dispose(); fillMesh.material.dispose(); }
+  if(strokeMesh){ scene.remove(strokeMesh); strokeMesh.geometry.dispose(); strokeMesh.material.dispose(); }
+
+  const g = new THREE.PlaneGeometry(viewW,viewH);
+
+  const glowMat = new THREE.MeshBasicMaterial({ map:glowTex,   transparent:true, depthWrite:false, opacity:1 });
+  glowMesh   = new THREE.Mesh(g,glowMat);   glowMesh.position.set(viewW/2,viewH/2,-0.6); scene.add(glowMesh);
+
+  const fillMat = new THREE.MeshBasicMaterial({ map:fillTex,   transparent:true, depthWrite:false, opacity:1 });
+  fillMesh   = new THREE.Mesh(g,fillMat);   fillMesh.position.set(viewW/2,viewH/2,-0.4); scene.add(fillMesh);
+
+  const strokeMat = new THREE.MeshBasicMaterial({ map:strokeTex, transparent:true, depthWrite:false, opacity:1 });
+  strokeMesh = new THREE.Mesh(g,strokeMat); strokeMesh.position.set(viewW/2,viewH/2,-0.2); scene.add(strokeMesh);
+}
+
+/* ---------- emitter ---------- */
+const vtx=`
+  attribute float aSize, aAlpha;
+  varying float vAlpha;
+  void main(){
+    vAlpha = aAlpha;
+    gl_PointSize = aSize;           // ortho = pixel-true
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0);
+  }`;
+const ftx=`
+  uniform sampler2D uMap;
+  varying float vAlpha;
+  void main(){
+    vec4 tex = texture2D(uMap, gl_PointCoord);
+    vec4 col = vec4(1.0,1.0,1.0, vAlpha) * tex;
+    if(col.a<0.01) discard; gl_FragColor = col;
+  }`;
+
+let eMesh,eGeom,eMat,ePos,eVel,eAge,eSize,eAlpha,eHomeX,eHomeY;
+function initEmitter(){
+  if(eMesh){ scene.remove(eMesh); eGeom.dispose(); eMat.dispose(); }
+  const MAX=Math.ceil(BIRTH_RATE*(LIFE_S+1));
+  ePos=new Float32Array(MAX*3);
+  eVel=new Float32Array(MAX*2);
+  eAge=new Float32Array(MAX);
+  eSize=new Float32Array(MAX);
+  eAlpha=new Float32Array(MAX);
+  eHomeX=new Float32Array(MAX);
+  eHomeY=new Float32Array(MAX);
+  for(let i=0;i<MAX;i++) eAge[i]=-1;
+
+  eGeom=new THREE.BufferGeometry();
+  eGeom.setAttribute('position', new THREE.BufferAttribute(ePos,3));
+  eGeom.setAttribute('aSize',    new THREE.BufferAttribute(eSize,1));
+  eGeom.setAttribute('aAlpha',   new THREE.BufferAttribute(eAlpha,1));
+
+  eMat=new THREE.ShaderMaterial({
+    vertexShader:vtx, fragmentShader:ftx,
+    uniforms:{ uMap:{ value:dotSharp(64) } },
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending
+  });
+  eMesh=new THREE.Points(eGeom,eMat); eMesh.position.z=0.0; scene.add(eMesh);
+}
+
+/* ---------- fields & forces ---------- */
+function curl(x,y,t){
+  const s=NOISE_SCALE*0.01;
+  const nx=Math.sin(y*s + t*0.9) - Math.cos(x*s*0.9 - t*0.7);
+  const ny=Math.cos(x*s + t*0.8) + Math.sin(y*s*1.1 + t*0.6);
+  return {fx:-ny*NOISE_BASE*NOISE_STR_X, fy:nx*NOISE_BASE*NOISE_STR_Y};
+}
+
+// spawn from live text dots
+let hIdx=1;
+function halton(i,b){ let f=1,r=0; while(i>0){ f/=b; r+=f*(i%b); i=Math.floor(i/b);} return r; }
+function pickLiveDot(){
+  const A=textGeom.attributes.position.array, N=A.length/3;
+  const idx=(Math.floor(halton(hIdx++,2)*N))|0, j=idx*3;
+  return { x:A[j] + (Math.random()-0.5)*SAMPLE_STEP,
+           y:A[j+1] + (Math.random()-0.5)*SAMPLE_STEP };
+}
+function spawn(i){
+  const p=pickLiveDot();
+  const j=i*3,k=i*2;
+  ePos[j]=p.x; ePos[j+1]=p.y; ePos[j+2]=0;
+  eVel[k]=0;   eVel[k+1]=-SPEED_UP;
+  eAge[i]=0;   eAlpha[i]=1;  eSize[i]=SIZE_PX;
+  eHomeX[i]=p.x; eHomeY[i]=p.y;
+}
+
+// hover
+const mouse={x:0,y:0,inside:false};
+canvas.addEventListener('pointermove',e=>{const r=canvas.getBoundingClientRect(); mouse.x=e.clientX-r.left; mouse.y=e.clientY-r.top; mouse.inside=true;});
+canvas.addEventListener('pointerleave',()=>mouse.inside=false);
+function attract(px,py,vx,vy,dt){
+  if(!mouse.inside) return {vx,vy};
+  const dx=mouse.x-px, dy=mouse.y-py, d=Math.hypot(dx,dy);
+  if(d>1e-4){
+    const s=Math.min(1, Math.max(0, 1 - d/ATTR_R));
+    const k=s + 0.08;
+    vx += (dx/d) * (ATTR_A * k) * dt;
+    vy += (dy/d) * (ATTR_A * k) * dt;
+  }
+  const drag=Math.max(0,1-ATTR_DAMP*dt);
+  return {vx:vx*drag, vy:vy*drag};
+}
+
+// confinement + edge magnet
+function confineAndEdge(px,py,vx,vy,dt){
+  if(!maskData) return {vx,vy};
+  const a=alphaAt(px,py);
+  const {nx,ny}=gradAt(px,py);
+
+  if(a < CONFINE_THRESH){
+    const deficit=(CONFINE_THRESH-a)/CONFINE_THRESH;
+    vx += nx*(CONFINE_GAIN*deficit)*dt;
+    vy += ny*(CONFINE_GAIN*deficit)*dt;
+  } else {
+    const edgeHi = Math.min(255, CONFINE_THRESH + EDGE_BIAS_BAND);
+    if(a < edgeHi){
+      const closeness = 1 - (a - CONFINE_THRESH) / (edgeHi - CONFINE_THRESH);
+      const gain = EDGE_BIAS_GAIN * closeness;
+      vx += nx * gain * dt;
+      vy += ny * gain * dt;
+    }
+  }
+  return {vx,vy};
+}
+function clampVel(vx,vy){
+  const s2=vx*vx+vy*vy, m2=MAX_SPEED*MAX_SPEED;
+  if(s2>m2){ const s=Math.sqrt(s2); return {vx:vx*(MAX_SPEED/s), vy:vy*(MAX_SPEED/s)}; }
+  return {vx,vy};
+}
+
+/* ---------- resize / camera ---------- */
+function resize(){
+  const w=canvas.clientWidth|0, h=canvas.clientHeight|0;
+  renderer.setSize(w,h,false);
+  camera.left=0; camera.right=w; camera.top=0; camera.bottom=h;
+  camera.near=-1000; camera.far=1000; camera.position.set(0,0,10);
+  camera.updateProjectionMatrix();
+  rasterText(w,h);
+  buildText(w,h);
+  initEmitter();
+}
+addEventListener('resize', resize);
+
+/* ---------- loop ---------- */
+let last=performance.now()/1000, acc=0;
+
+function animate(){
+  requestAnimationFrame(animate);
+  const now=performance.now()/1000;
+  let dt=now-last; last=now; if(dt>0.05) dt=0.05;
+
+  // base dots: nearly locked, tiny life
+  if(textGeom){
+    const A=textGeom.attributes.position.array, N=textHome.length/2;
+    for(let i=0;i<N;i++){
+      const j=i*3,k=i*2;
+      let x=A[j], y=A[j+1], hx=textHome[k], hy=textHome[k+1];
+      let vx=textVel[k], vy=textVel[k+1];
+
+      vx += (hx-x)*0.36*dt;
+      vy += (hy-y)*0.36*dt;
+
+      const r1=attract(x,y,vx,vy,dt); vx=r1.vx; vy=r1.vy;
+
+      vx*=0.90; vy*=0.90; x+=vx; y+=vy;
+
+      const amp=tAmp[i], f=tFreq[i], s=tSeed[i];
+      x += Math.sin((now+s)*f*2.0)*amp;
+      y += -Math.abs(Math.cos((now+s*1.37)*f*2.2))*amp*0.45;
+
+      textVel[k]=vx; textVel[k+1]=vy; A[j]=x; A[j+1]=y;
+    }
+    textGeom.attributes.position.needsUpdate=true;
+  }
+
+  // births
+  acc += BIRTH_RATE*dt;
+  while(acc>=1){
+    let idx=-1; const MAX=eAge.length;
+    for(let i=0;i<MAX;i++){ if(eAge[i]<0){ idx=i; break; } }
+    if(idx===-1) break;
+    spawn(idx);
+    acc-=1;
+  }
+
+  // particles
+  if(eGeom){
+    const MAX=eAge.length;
+    for(let i=0;i<MAX;i++){
+      if(eAge[i]<0) continue;
+      const j=i*3,k=i*2;
+      let px=ePos[j], py=ePos[j+1];
+      let vx=eVel[k], vy=eVel[k+1];
+
+      // tiny curl + gravity
+      const c=curl(px,py,now);
+      vx += c.fx*dt;
+      vy += (c.fy + GRAVITY)*dt;
+
+      // tight damped spring to glyph
+      const tx=eHomeX[i], ty=eHomeY[i]-SHAPE_HOVER;
+      vx += (tx-px)*(SHAPE_STIFF_X*dt) - (SHAPE_DAMP_X*vx)*dt;
+      vy += (ty-py)*(SHAPE_STIFF_Y*dt) - (SHAPE_DAMP_Y*vy)*dt;
+
+      // leash
+      const dx=tx-px, dy=ty-py, dev=Math.hypot(dx,dy);
+      if(dev>LEASH_RADIUS){
+        const pull=(dev-LEASH_RADIUS)*(LEASH_GAIN*dt);
+        vx += (dx/dev)*pull; vy += (dy/dev)*pull;
+      }
+
+      // confinement & edge magnet
+      const ce=confineAndEdge(px,py,vx,vy,dt); vx=ce.vx; vy=ce.vy;
+
+      // hover
+      const r2=attract(px,py,vx,vy,dt); vx=r2.vx; vy=r2.vy;
+
+      // clamp + integrate
+      const cv=clampVel(vx,vy); vx=cv.vx; vy=cv.vy;
+      px += vx*dt; py += vy*dt;
+
+      ePos[j]=px; ePos[j+1]=py; eVel[k]=vx; eVel[k+1]=vy;
+
+      // fade/kill
+      eAge[i]+=dt; eAlpha[i]=1-Math.min(1,eAge[i]/LIFE_S);
+      if(eAge[i]>=LIFE_S || py<-64 || py>camera.bottom+128){ eAge[i]=-1; eAlpha[i]=0; }
+    }
+    eGeom.attributes.position.needsUpdate=true;
+    eGeom.attributes.aSize.needsUpdate=true;
+    eGeom.attributes.aAlpha.needsUpdate=true;
+  }
+
+  renderer.render(scene,camera);
+}
+
+/* ---------- boot ---------- */
+function boot(){
+  const w=canvas.clientWidth|0, h=canvas.clientHeight|0;
+  renderer.setSize(w,h,false);
+  camera.left=0; camera.right=w; camera.top=0; camera.bottom=h;
+  camera.near=-1000; camera.far=1000; camera.position.set(0,0,10);
+  camera.updateProjectionMatrix();
+  rasterText(w,h);
+  buildText(w,h);
+  initEmitter();
+  animate();
+}
+addEventListener('resize', boot);
+boot();
+})();
+</script>
